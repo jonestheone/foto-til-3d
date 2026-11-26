@@ -8,7 +8,8 @@ import { buildMeshData } from './mesh.js';
 import { exportGLB, exportSTL, downloadBlob } from './export.js';
 import { openWebcam } from './camera.js';
 
-const MAX_IMAGE_SIZE = 1024; // større billeder skaleres ned – det er rigeligt til 3D og meget hurtigere
+const MAX_IMAGE_SIZE = 2048; // fotoet på modellen: op til 2048 px, så det er skarpt
+const ANALYSIS_SIZE = 1024; // det AI'en ser: 1024 px er det, modellerne selv bruger
 const THUMB_SIZE = 200;
 
 const $ = (sel) => document.querySelector(sel);
@@ -36,6 +37,7 @@ const ui = {
   thumbMask: $('#thumb-mask'),
   thumbDepth: $('#thumb-depth'),
   optBg: $('#opt-bg'),
+  optHd: $('#opt-hd'),
   optWire: $('#opt-wire'),
   optRotate: $('#opt-rotate'),
   dlGlb: $('#dl-glb'),
@@ -44,6 +46,7 @@ const ui = {
 const sliders = {
   depth: { input: $('#opt-depth'), out: $('#val-depth'), format: (v) => `${v} %` },
   thick: { input: $('#opt-thick'), out: $('#val-thick'), format: (v) => `${v} %` },
+  detail: { input: $('#opt-detail'), out: $('#val-detail'), format: (v) => `${v} %` },
   smooth: { input: $('#opt-smooth'), out: $('#val-smooth'), format: (v) => `${v}` },
   res: { input: $('#opt-res'), out: $('#val-res'), format: (v) => `${v}` },
 };
@@ -53,9 +56,10 @@ const MODE_HELP = {
 };
 
 export const state = {
-  photo: null, // { canvas, width, height }
-  depth: null, // Float32Array – højere tal = tættere på kameraet
-  mask: null, // Uint8Array – 255 = motiv, 0 = baggrund
+  photo: null, // { canvas, width, height } – op til 2048 px, bruges som overflade på modellen
+  analysis: null, // { canvas, width, height } – op til 1024 px, det AI'en ser
+  depth: null, // Float32Array i analyse-størrelse – højere tal = tættere på kameraet
+  mask: null, // Uint8Array i analyse-størrelse – 255 = motiv, 0 = baggrund
   bledTexture: null, // fotoet hvor motivets farver er "smurt" ud over kanten (se makeBledTexture)
   device: null, // 'webgpu' eller 'wasm'
   mode: 'figure',
@@ -129,36 +133,44 @@ export async function handleFile(file) {
     return;
   }
 
-  // Skalér ned og tegn på et canvas
-  const scale = Math.min(1, MAX_IMAGE_SIZE / Math.max(img.width, img.height));
-  const width = Math.max(8, Math.round(img.width * scale));
-  const height = Math.max(8, Math.round(img.height * scale));
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(img, 0, 0, width, height);
+  // To udgaver af billedet: et skarpt til modellens overflade og et mindre til AI'en
+  // (AI-modellerne arbejder alligevel med ca. 1024 px, så det sparer tid og hukommelse)
+  state.photo = drawScaled(img, MAX_IMAGE_SIZE);
+  state.analysis = drawScaled(state.photo.canvas, ANALYSIS_SIZE);
   img.close?.();
-
-  state.photo = { canvas, width, height };
+  const { canvas } = state.photo;
   state.depth = null;
   state.mask = null;
   state.bledTexture = null;
   drawThumb(ui.thumbPhoto, canvas);
 
-  await analyze({ depth: true, background: ui.optBg.checked });
+  await analyze({ depth: true, background: ui.optBg.checked }, { reframe: true });
+}
+
+/** Tegn et billede på et nyt canvas, så den længste side højst er maxSize. */
+function drawScaled(source, maxSize) {
+  const scale = Math.min(1, maxSize / Math.max(source.width, source.height));
+  const width = Math.max(8, Math.round(source.width * scale));
+  const height = Math.max(8, Math.round(source.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(source, 0, 0, width, height);
+  return { canvas, width, height };
 }
 
 /** Send billedet til AI'en og byg modellen bagefter. */
-async function analyze(tasks) {
+async function analyze(tasks, { reframe = false } = {}) {
   state.busy = true;
-  showBusy(tasks.depth ? 'Analyserer billedet …' : 'Finder motivet …');
-  const { canvas, width, height } = state.photo;
+  showBusy(tasks.depth && tasks.background ? 'Analyserer billedet …' : tasks.depth ? 'Beregner dybde …' : 'Finder motivet …');
+  const { canvas, width, height } = state.analysis;
   const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+  const detail = ui.optHd.checked ? 'high' : 'normal'; // "ekstra skarp dybde"
 
   try {
-    const res = await askWorker({ type: 'analyze', image: { data: pixels, width, height }, tasks }, [pixels.buffer]);
+    const res = await askWorker({ type: 'analyze', image: { data: pixels, width, height }, tasks, detail }, [pixels.buffer]);
     if (res.depth) state.depth = res.depth;
     state.device = res.device;
 
@@ -166,12 +178,12 @@ async function analyze(tasks) {
     await nextPaint();
     if (res.mask) {
       state.mask = res.mask;
-      state.bledTexture = makeBledTexture(state.photo, state.mask);
+      state.bledTexture = makeBledTexture(state.photo, scaleMask(state.mask, state.analysis, state.photo));
     }
     drawMaskThumb();
     drawDepthThumb();
     showModelUI();
-    rebuild({ reframe: Boolean(tasks.depth) });
+    rebuild({ reframe });
   } catch (err) {
     console.error(err);
     showToast(`Der skete en fejl: ${err.message}`);
@@ -191,6 +203,7 @@ function currentOptions() {
     mode: state.mode,
     depthAmount: sliders.depth.input.value / 100,
     thickness: sliders.thick.input.value / 100,
+    detailBoost: sliders.detail.input.value / 100,
     smoothing: Number(sliders.smooth.input.value),
     resolution: Number(sliders.res.input.value),
   };
@@ -198,7 +211,7 @@ function currentOptions() {
 
 export function rebuild({ reframe = false } = {}) {
   if (!state.photo || !state.depth) return;
-  const { width, height } = state.photo;
+  const { width, height } = state.analysis; // dybde og maske har AI'ens størrelse
   const useMask = ui.optBg.checked && state.mask;
   const input = { width, height, depth: state.depth, mask: useMask ? state.mask : null, ...currentOptions() };
 
@@ -226,6 +239,30 @@ function setTexture(canvas) {
   viewer.setTexture(canvas);
 }
 
+/** Skalér masken fra AI'ens størrelse op til fotoets størrelse (blødt, via et canvas). */
+function scaleMask(mask, from, to) {
+  if (from.width === to.width && from.height === to.height) return mask;
+  const src = document.createElement('canvas');
+  src.width = from.width;
+  src.height = from.height;
+  const img = new ImageData(from.width, from.height);
+  for (let i = 0; i < mask.length; i++) {
+    img.data[i * 4] = mask[i];
+    img.data[i * 4 + 3] = 255;
+  }
+  src.getContext('2d').putImageData(img, 0, 0);
+  const dst = document.createElement('canvas');
+  dst.width = to.width;
+  dst.height = to.height;
+  const ctx = dst.getContext('2d', { willReadFrequently: true });
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(src, 0, 0, to.width, to.height);
+  const big = ctx.getImageData(0, 0, to.width, to.height).data;
+  const out = new Uint8Array(to.width * to.height);
+  for (let i = 0; i < out.length; i++) out[i] = big[i * 4];
+  return out;
+}
+
 /**
  * Laver en kopi af fotoet, hvor motivets farver "smøres" ud over kanten.
  * Ellers får siderne af 3D-modellen baggrundens farve (fx en lyserød sofa),
@@ -240,12 +277,14 @@ function makeBledTexture(photo, mask) {
   ctx.drawImage(canvas, 0, 0);
   const img = ctx.getImageData(0, 0, w, h);
   const px = img.data;
+  const n = w * h;
+  const erodeSteps = Math.max(2, Math.round(Math.max(w, h) / 340)); // ca. 3 px ved 1024, 6 px ved 2048
 
   // 1) "Sikre" pixels: helt inde i motivet, et par pixels fra kanten
-  let safe = new Uint8Array(w * h);
-  for (let i = 0; i < safe.length; i++) safe[i] = mask[i] >= 230 ? 1 : 0;
-  for (let k = 0; k < 3; k++) {
-    const eroded = new Uint8Array(safe.length);
+  let safe = new Uint8Array(n);
+  for (let i = 0; i < n; i++) safe[i] = mask[i] >= 230 ? 1 : 0;
+  for (let k = 0; k < erodeSteps; k++) {
+    const eroded = new Uint8Array(n);
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1; x < w - 1; x++) {
         const i = y * w + x;
@@ -255,38 +294,58 @@ function makeBledTexture(photo, mask) {
     safe = eroded;
   }
 
-  // 2) Skub farverne udad – én ring af pixels ad gangen
-  for (let pass = 0; pass < 16; pass++) {
-    const next = safe.slice();
-    let changed = 0;
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = y * w + x;
-        if (safe[i]) continue;
-        let r = 0;
-        let g = 0;
-        let b = 0;
-        let c = 0;
-        const take = (j) => {
-          r += px[j * 4];
-          g += px[j * 4 + 1];
-          b += px[j * 4 + 2];
-          c++;
-        };
-        if (x > 0 && safe[i - 1]) take(i - 1);
-        if (x < w - 1 && safe[i + 1]) take(i + 1);
-        if (y > 0 && safe[i - w]) take(i - w);
-        if (y < h - 1 && safe[i + w]) take(i + w);
-        if (!c) continue;
-        px[i * 4] = r / c;
-        px[i * 4 + 1] = g / c;
-        px[i * 4 + 2] = b / c;
-        next[i] = 1;
-        changed++;
-      }
+  // 2) Skub farverne udad – én ring af pixels ad gangen, kun langs kanten af motivet
+  const queued = new Uint8Array(n);
+  const neighbours = (i, fn) => {
+    const x = i % w;
+    if (x > 0) fn(i - 1);
+    if (x < w - 1) fn(i + 1);
+    if (i >= w) fn(i - w);
+    if (i < n - w) fn(i + w);
+  };
+  let ring = [];
+  for (let i = 0; i < n; i++) {
+    if (safe[i]) continue;
+    let touches = false;
+    neighbours(i, (j) => (touches ||= safe[j] === 1));
+    if (touches) {
+      ring.push(i);
+      queued[i] = 1;
     }
-    safe = next;
-    if (!changed) break;
+  }
+  const rings = 4 * erodeSteps + 6;
+  for (let r = 0; r < rings && ring.length; r++) {
+    // Find farverne for hele ringen først, og skriv dem bagefter
+    const colors = new Float32Array(ring.length * 3);
+    ring.forEach((i, k) => {
+      let c = 0;
+      neighbours(i, (j) => {
+        if (!safe[j]) return;
+        colors[k * 3] += px[j * 4];
+        colors[k * 3 + 1] += px[j * 4 + 1];
+        colors[k * 3 + 2] += px[j * 4 + 2];
+        c++;
+      });
+      colors[k * 3] /= c;
+      colors[k * 3 + 1] /= c;
+      colors[k * 3 + 2] /= c;
+    });
+    ring.forEach((i, k) => {
+      px[i * 4] = colors[k * 3];
+      px[i * 4 + 1] = colors[k * 3 + 1];
+      px[i * 4 + 2] = colors[k * 3 + 2];
+      safe[i] = 1;
+    });
+    const next = [];
+    for (const i of ring) {
+      neighbours(i, (j) => {
+        if (!safe[j] && !queued[j]) {
+          queued[j] = 1;
+          next.push(j);
+        }
+      });
+    }
+    ring = next;
   }
   ctx.putImageData(img, 0, 0);
   return out;
@@ -343,16 +402,24 @@ function drawMaskThumb() {
     ctx.drawImage(state.photo.canvas, 0, 0, w, h);
     return;
   }
-  const { canvas, width, height } = state.photo;
+  // Fotoet i lille størrelse, hvor masken bestemmer gennemsigtigheden
+  const { canvas } = state.photo;
+  const { width, height } = state.analysis;
   const tmp = document.createElement('canvas');
-  tmp.width = width;
-  tmp.height = height;
+  tmp.width = w;
+  tmp.height = h;
   const tctx = tmp.getContext('2d');
-  tctx.drawImage(canvas, 0, 0);
-  const img = tctx.getImageData(0, 0, width, height);
-  for (let i = 0; i < state.mask.length; i++) img.data[i * 4 + 3] = state.mask[i];
+  tctx.drawImage(canvas, 0, 0, w, h);
+  const img = tctx.getImageData(0, 0, w, h);
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(height - 1, Math.floor(((y + 0.5) * height) / h));
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(width - 1, Math.floor(((x + 0.5) * width) / w));
+      img.data[(y * w + x) * 4 + 3] = state.mask[sy * width + sx];
+    }
+  }
   tctx.putImageData(img, 0, 0);
-  ctx.drawImage(tmp, 0, 0, w, h);
+  ctx.drawImage(tmp, 0, 0);
 }
 
 // Farveskala til dybdekortet: mørk lilla (langt væk) → gul (tæt på)
@@ -366,7 +433,7 @@ const DEPTH_COLORS = [
 
 function drawDepthThumb() {
   if (!state.depth) return;
-  const { width, height } = state.photo;
+  const { width, height } = state.analysis;
   let lo = Infinity;
   let hi = -Infinity;
   for (const d of state.depth) {
@@ -374,24 +441,27 @@ function drawDepthThumb() {
     if (d > hi) hi = d;
   }
   const span = hi - lo || 1;
-  const tmp = document.createElement('canvas');
-  tmp.width = width;
-  tmp.height = height;
-  const tctx = tmp.getContext('2d');
-  const img = tctx.createImageData(width, height);
-  for (let i = 0; i < state.depth.length; i++) {
-    const t = ((state.depth[i] - lo) / span) * (DEPTH_COLORS.length - 1);
-    const k = Math.min(DEPTH_COLORS.length - 2, Math.floor(t));
-    const f = t - k;
-    const a = DEPTH_COLORS[k];
-    const b = DEPTH_COLORS[k + 1];
-    img.data[i * 4] = a[0] + (b[0] - a[0]) * f;
-    img.data[i * 4 + 1] = a[1] + (b[1] - a[1]) * f;
-    img.data[i * 4 + 2] = a[2] + (b[2] - a[2]) * f;
-    img.data[i * 4 + 3] = 255;
+  // Farvelæg kun de pixels der skal vises i det lille billede
+  const ctx = sizeThumb(ui.thumbDepth);
+  const { width: w, height: h } = ui.thumbDepth;
+  const img = ctx.createImageData(w, h);
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(height - 1, Math.floor(((y + 0.5) * height) / h));
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(width - 1, Math.floor(((x + 0.5) * width) / w));
+      const t = ((state.depth[sy * width + sx] - lo) / span) * (DEPTH_COLORS.length - 1);
+      const k = Math.min(DEPTH_COLORS.length - 2, Math.floor(t));
+      const f = t - k;
+      const a = DEPTH_COLORS[k];
+      const b = DEPTH_COLORS[k + 1];
+      const o = (y * w + x) * 4;
+      img.data[o] = a[0] + (b[0] - a[0]) * f;
+      img.data[o + 1] = a[1] + (b[1] - a[1]) * f;
+      img.data[o + 2] = a[2] + (b[2] - a[2]) * f;
+      img.data[o + 3] = 255;
+    }
   }
-  tctx.putImageData(img, 0, 0);
-  drawThumb(ui.thumbDepth, tmp);
+  ctx.putImageData(img, 0, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -527,7 +597,23 @@ ui.optBg.addEventListener('change', async () => {
 });
 
 // Telefoner: lidt færre punkter som standard, så skyderne føles hurtige
-if (isTouchDevice) sliders.res.input.value = 192;
+if (isTouchDevice) {
+  sliders.res.input.max = 512;
+  sliders.res.input.value = 256;
+}
+
+// "Ekstra skarp dybde" er slået til, når der er et grafikkort (WebGPU) – på processoren er det for langsomt
+(async () => {
+  try {
+    const adapter = await navigator.gpu?.requestAdapter();
+    ui.optHd.checked = Boolean(adapter?.features.has('shader-f16'));
+  } catch {
+    ui.optHd.checked = false;
+  }
+})();
+ui.optHd.addEventListener('change', () => {
+  if (state.photo && state.depth && !state.busy) analyze({ depth: true, background: false });
+});
 
 for (const s of Object.values(sliders)) {
   s.out.textContent = s.format(s.input.value);
@@ -632,8 +718,15 @@ if (isIOS && !isStandalone) ui.iosHint.hidden = false;
 /* Småting                                                             */
 /* ------------------------------------------------------------------ */
 
+/** Giv browseren et øjeblik til at tegne (fx "Bygger 3D-model …") – men vent ikke, hvis siden er skjult. */
 function nextPaint() {
-  return new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, 100); // skjult side/app i baggrunden: fortsæt alligevel
+    requestAnimationFrame(() => {
+      clearTimeout(timer);
+      setTimeout(resolve, 0);
+    });
+  });
 }
 function toMB(bytes) {
   return (bytes / 1024 / 1024).toFixed(0);

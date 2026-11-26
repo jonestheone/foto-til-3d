@@ -28,7 +28,12 @@ Der skal **ikke installeres noget**. Du skal bare have internet første gang, fo
 - **Vælg billede**: vælg en fil. Du kan også trække et billede ind i vinduet eller indsætte med `Ctrl+V`.
 - **Figur**: motivet "pustes op" og får en afrundet bagside. Godt til ting, dyr og personer.
 - **Relief**: billedet bliver til en plade med relief og flad bagside. Godt til 3D-print.
-- **Dybde / Tykkelse / Glathed / Detaljer**: justér formen. Modellen opdateres med det samme.
+- **Ekstra skarp dybde**: AI'en ser billedet i højere opløsning (1022 i stedet for 518 px), så øjne, hår
+  og folder bliver tydeligere. Det tager længere tid og er derfor kun slået til, når der er et grafikkort.
+- **Dybde / Tykkelse**: hvor meget modellen stikker frem, og hvor tyk den er.
+- **Fremhæv detaljer**: forstærker de små former (næse, øjne, pels, folder). 0 % = som AI'en så det.
+- **Glathed**: glatter små ujævnheder ud. Lavt tal = flere detaljer, men også mere "støj".
+- **Opløsning**: hvor mange punkter 3D-nettet har (op til 768). Flere punkter = finere detaljer, men større filer.
 - **Download GLB**: kan åbnes i Windows' *3D Viewer*, Blender, PowerPoint, Sketchfab m.m.
 - **Download STL**: til 3D-printere (Cura, PrusaSlicer, Bambu Studio). Den længste side er 100 mm.
 
@@ -52,12 +57,15 @@ Der skal **ikke installeres noget**. Du skal bare have internet første gang, fo
 
 Kort fortalt om 3D-formen (`mesh.js`):
 
-1. Et gitter på fx 256 × 192 punkter lægges over billedet.
-2. Hvert punkt får en højde fra dybdekortet (tæt på kameraet = højt).
+1. Et gitter på fx 384 × 307 punkter lægges over billedet.
+2. Hvert punkt får en højde fra dybdekortet (tæt på kameraet = højt) – gennemsnittet af alle
+   pixels i sin celle. Ude ved motivets kant glider dybden over i en udglattet udgave, fordi
+   AI'ens dybde er upålidelig lige ved kanten. "Fremhæv detaljer" forstærker forskellen mellem
+   dybden og en udglattet udgave af den (en såkaldt *unsharp mask*).
 3. I **Figur**-tilstand løses en *Poisson-ligning* inde i motivet. Det giver en blød "ballon-form",
    hvor tynde dele (arme, ører, haler) bliver tynde og tykke dele bliver tykke.
    For- og bagsiden mødes i kanten, så modellen er lukket ("vandtæt") og kan 3D-printes.
-4. Fotoet bruges som "maling" (tekstur) på modellen.
+4. Fotoet (op til 2048 px) bruges som "maling" (tekstur) på modellen. AI'en arbejder selv med 1024 px.
 
 ## Begrænsninger
 
@@ -81,8 +89,9 @@ Appen ligger på **https://jonestheone.github.io/foto-til-3d/** (GitHub Pages).
 Første gang hentes AI-modellerne (ca. 130 MB), så brug gerne Wi-Fi. Derefter husker telefonen
 både appen og modellerne, og så virker den også uden internet.
 
-Nyere telefoner har WebGPU (Chrome på Android 12+, iPhone med iOS 26), og så tager et billede kun
-nogle få sekunder. Ældre telefoner bruger processoren i stedet, og så kan det tage op til et minut.
+Nyere telefoner har WebGPU (Chrome på Android 12+, iPhone med iOS 26) og bruger grafikkortet. Med
+"Ekstra skarp dybde" tager et billede typisk 10–20 sekunder – slå den fra, hvis det skal gå hurtigere.
+Ældre telefoner bruger processoren i stedet, og så kan det tage op til et minut.
 
 ### Opdatér appen online
 

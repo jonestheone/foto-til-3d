@@ -21,6 +21,8 @@ import {
 
 env.allowLocalModels = false; // hent altid modeller fra Hugging Face (de caches lokalt)
 
+const HIGH_DETAIL_SIZE = 1022; // længste side for dybde-AI'en i "ekstra skarp" tilstand (73 x 14)
+
 const MODELS = {
   background: {
     id: 'briaai/RMBG-1.4', // OBS: licens kun til ikke-kommerciel brug
@@ -52,7 +54,21 @@ const MODELS = {
     load(options) {
       return pipeline('depth-estimation', this.id, options);
     },
-    async run(estimator, image) {
+    async run(estimator, image, { detail }) {
+      // Hvor stort billedet er, når dybde-AI'en ser det. Modellen er trænet på 518 px,
+      // men giver skarpere detaljer (øjne, hår, folder) ved højere opløsning – på
+      // bekostning af tid. Billedet skal have sider der går op i 14 (modellens "felter").
+      const proc = estimator.processor.image_processor;
+      proc.defaultSize ??= proc.size;
+      if (detail === 'high') {
+        const longSide = Math.max(image.width, image.height);
+        const target = Math.min(HIGH_DETAIL_SIZE, Math.max(518, longSide));
+        const scale = target / longSide;
+        const to14 = (x) => Math.max(14, Math.round((x * scale) / 14) * 14);
+        proc.size = { width: to14(image.width), height: to14(image.height) };
+      } else {
+        proc.size = proc.defaultSize;
+      }
       const { predicted_depth } = await estimator(image);
       const t = predicted_depth.type === 'float32' ? predicted_depth : predicted_depth.to('float32');
       // Højere tal = tættere på kameraet. Samme størrelse som billedet.
@@ -117,7 +133,7 @@ function load(key) {
 
 const timings = {}; // hvor lang tid hvert trin tog (vises i konsollen)
 
-async function run(id, key, image) {
+async function run(id, key, image, options) {
   if (!ready[key]) status(id, 'Henter AI-modeller …');
   let t = performance.now();
   const model = await load(key);
@@ -125,15 +141,15 @@ async function run(id, key, image) {
   ready[key] = true;
   status(id, MODELS[key].status);
   t = performance.now();
-  const out = await MODELS[key].run(model, image);
+  const out = await MODELS[key].run(model, image, options);
   timings[`${key}: kør`] = Math.round(performance.now() - t);
   return out;
 }
 
 /** Prøv på grafikkortet – går det galt, prøver vi igen på processoren. */
-async function runWithFallback(id, key, makeImage) {
+async function runWithFallback(id, key, makeImage, options = {}) {
   try {
-    return await run(id, key, makeImage());
+    return await run(id, key, makeImage(), options);
   } catch (err) {
     if (backend?.device !== 'webgpu') throw err;
     console.warn(`WebGPU fejlede (${key}) – skifter til CPU (WASM).`, err);
@@ -144,7 +160,7 @@ async function runWithFallback(id, key, makeImage) {
       delete ready[k];
       old.then((m) => m.dispose?.()).catch(() => {});
     }
-    return await run(id, key, makeImage());
+    return await run(id, key, makeImage(), options);
   }
 }
 
@@ -159,7 +175,7 @@ self.addEventListener('message', async ({ data }) => {
     return;
   }
   if (data?.type !== 'analyze') return;
-  const { id, image, tasks } = data;
+  const { id, image, tasks, detail = 'normal' } = data;
   const { width, height } = image;
   // Hver model får sin egen kopi af billedet (de må gerne ændre i det)
   const makeImage = () => new RawImage(new Uint8ClampedArray(image.data), width, height, 4);
@@ -176,7 +192,7 @@ self.addEventListener('message', async ({ data }) => {
       transfer.push(result.mask.buffer);
     }
     if (tasks.depth) {
-      result.depth = await runWithFallback(id, 'depth', makeImage);
+      result.depth = await runWithFallback(id, 'depth', makeImage, { detail });
       transfer.push(result.depth.buffer);
     }
 

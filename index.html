@@ -106,7 +106,12 @@
           <button type="button" class="seg" data-mode="relief" role="radio" aria-checked="false">Relief</button>
         </div>
         <p id="mode-help" class="help"></p>
+      </section>
+
+      <section class="group">
+        <h3>AI</h3>
         <label class="check"><input type="checkbox" id="opt-bg" checked> Fjern baggrund</label>
+        <label class="check"><input type="checkbox" id="opt-hd"> Ekstra skarp dybde <span class="check-note">(tager længere tid)</span></label>
       </section>
 
       <section class="group">
@@ -120,12 +125,16 @@
           <input type="range" id="opt-thick" min="0" max="100" value="50">
         </div>
         <div class="field">
-          <div class="field-head"><label for="opt-smooth">Glathed</label><output id="val-smooth"></output></div>
-          <input type="range" id="opt-smooth" min="0" max="10" value="3">
+          <div class="field-head"><label for="opt-detail">Fremhæv detaljer</label><output id="val-detail"></output></div>
+          <input type="range" id="opt-detail" min="0" max="100" value="40">
         </div>
         <div class="field">
-          <div class="field-head"><label for="opt-res">Detaljer</label><output id="val-res"></output></div>
-          <input type="range" id="opt-res" min="64" max="512" step="32" value="256">
+          <div class="field-head"><label for="opt-smooth">Glathed</label><output id="val-smooth"></output></div>
+          <input type="range" id="opt-smooth" min="0" max="10" value="1">
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="opt-res">Opløsning</label><output id="val-res"></output></div>
+          <input type="range" id="opt-res" min="64" max="768" step="32" value="384">
         </div>
         <div class="checks">
           <label class="check"><input type="checkbox" id="opt-wire"> Vis trådnet</label>

@@ -2,12 +2,16 @@
  * mesh.js – bygger et 3D-trekantnet ud fra et dybdekort (og evt. en maske).
  *
  * Sådan virker det:
- *  1. Vi lægger et gitter (fx 256 x 192 punkter) hen over billedet.
+ *  1. Vi lægger et gitter (fx 384 x 307 punkter) hen over billedet.
  *  2. Hvert punkt aflæser dybdekortet: tæt på kameraet = højt (z).
  *  3. Form "Figur": motivet pustes op som en ballon (Poisson-ligningen),
  *     så det får en afrundet bagside, og for- og bagside mødes i kanten.
  *     Modellen bliver lukket ("vandtæt"), så den også kan 3D-printes.
  *  4. Form "Relief": en plade med relief foran, flad bagside og lodrette sider.
+ *
+ * Det tunge arbejde (hvilke punkter er motiv, trekanterne, "oppustningen")
+ * afhænger kun af billedet, opløsningen og formen. Det gemmes, så skyderne
+ * Dybde, Tykkelse, Fremhæv detaljer og Glathed kan opdatere modellen hurtigt.
  *
  * Filen bruger ikke Three.js – den returnerer bare tal-arrays
  * (positioner, UV-koordinater og trekanter), som viewer.js viser.
@@ -15,13 +19,14 @@
 
 /**
  * @param {object} o
- * @param {number} o.width            billedets bredde i pixels
- * @param {number} o.height           billedets højde i pixels
+ * @param {number} o.width            dybdekortets bredde i pixels
+ * @param {number} o.height           dybdekortets højde i pixels
  * @param {Float32Array} o.depth      dybde pr. pixel (højere = tættere på)
  * @param {Uint8Array|null} o.mask    0–255 pr. pixel (255 = motiv), eller null = hele billedet
  * @param {'figure'|'relief'} o.mode
  * @param {number} o.depthAmount      0–1: hvor kraftigt dybden vises
  * @param {number} o.thickness        0–1: tykkelse (figur) eller pladetykkelse (relief)
+ * @param {number} o.detailBoost      0–1: hvor meget små former (næse, øjne, pels) forstærkes
  * @param {number} o.smoothing        0–10: hvor meget dybden glattes
  * @param {number} o.resolution       antal gitterpunkter på den længste led
  */
@@ -33,10 +38,18 @@ export function buildMeshData({
   mode = 'figure',
   depthAmount = 0.35,
   thickness = 0.5,
-  smoothing = 3,
-  resolution = 256,
+  detailBoost = 0.4,
+  smoothing = 1,
+  resolution = 384,
 }) {
   const isFigure = mode === 'figure';
+  const timings = {}; // hvor lang tid hvert trin tager (ms) – nyttigt hvis noget bliver langsomt
+  let lapStart = performance.now();
+  const lap = (name) => {
+    const now = performance.now();
+    timings[name] = Math.round((now - lapStart) * 10) / 10;
+    lapStart = now;
+  };
 
   // ---------- 1. Gitter ----------
   const res = Math.max(16, Math.round(resolution));
@@ -56,26 +69,10 @@ export function buildMeshData({
   const sx = (width - 1) / (cols - 1);
   const sy = (height - 1) / (rows - 1);
 
-  // ---------- 2. Aflæs dybde og maske i gitterpunkterne ----------
-  const raw = new Float32Array(n);
-  let inside = new Uint8Array(n);
-  for (let j = 0, v = 0; j < rows; j++) {
-    for (let i = 0; i < cols; i++, v++) {
-      const px = i * sx;
-      const py = j * sy;
-      raw[v] = sample(depth, width, height, px, py);
-      inside[v] = mask ? (sample(mask, width, height, px, py) >= 128 ? 1 : 0) : 1;
-    }
-  }
-  if (isFigure) inside = openMask(inside, cols, rows);
-  if (mask) inside = cleanMask(inside, cols, rows);
-  let insideCount = 0;
-  for (let v = 0; v < n; v++) insideCount += inside[v];
-  if (insideCount < 16) {
-    const err = new Error('Kunne ikke finde et motiv i billedet.');
-    err.code = 'NO_SUBJECT';
-    throw err;
-  }
+  // ---------- 2. Formen: motivets punkter, trekanterne og "oppustningen" ----------
+  const topo = getTopology(depth, mask, width, height, cols, rows, isFigure);
+  const { inside, raw, tri, tc, used, onBoundary, boundaryEdges, poisson, edgeDist } = topo;
+  lap('form');
 
   // ---------- 3. Glat dybden og skalér den til 0–1 inden for motivet ----------
   const radius = Math.round((smoothing * maxDim) / 256);
@@ -85,102 +82,64 @@ export function buildMeshData({
   const rel = new Float32Array(n); // 0 = længst væk, 1 = tættest på
   for (let v = 0; v < n; v++) if (inside[v]) rel[v] = clamp01((smooth[v] - lo) / span);
 
+  // Fremhæv detaljer ("unsharp mask"): forskellen mellem dybden og en udglattet
+  // udgave af den er de små former (næse, øjne, pels, folder) – dem forstærker vi.
+  if (detailBoost > 0) {
+    const base = maskedBlur(rel, inside, cols, rows, Math.max(2, Math.round(maxDim * 0.03)));
+    const k = detailBoost * 2.5;
+    for (let v = 0; v < n; v++) {
+      if (inside[v]) rel[v] = Math.min(1.3, Math.max(-0.3, rel[v] + k * (rel[v] - base[v])));
+    }
+  }
+
+  // Helt ude ved motivets kant er AI'ens dybde upålidelig (den blander forgrund og
+  // baggrund), og det giver takker. Derfor glider vi over i en udglattet dybde dér.
+  const edgeBand = Math.max(2, maxDim / 128);
+  const relEdge = maskedBlur(rel, inside, cols, rows, Math.ceil(edgeBand * 2));
+  for (let v = 0; v < n; v++) {
+    if (!inside[v]) continue;
+    const w = smoothstep(1, 1 + edgeBand, edgeDist[v]); // 0 ved kanten, 1 længere inde
+    rel[v] = relEdge[v] + (rel[v] - relEdge[v]) * w;
+  }
+  lap('dybde');
+
   // ---------- 4. Højde (z) for forside og bagside ----------
   const zFront = new Float32Array(n);
   const zBack = new Float32Array(n);
   const reliefHeight = depthAmount * 0.8;
 
   if (isFigure) {
-    // "Pust op": løs Poisson-ligningen inde i motivet. sqrt(2u) giver et
-    // cirkelrundt tværsnit, hvor tynde dele (arme, ører) bliver tynde.
-    const u = solvePoisson(inside, cols, rows);
-    // Bagsiden følger en meget udglattet dybde, så fx en næse ikke "trykkes igennem"
+    // sqrt(2u) af Poisson-løsningen giver et cirkelrundt tværsnit,
+    // hvor tynde dele (arme, ører) bliver tynde og tykke dele tykke.
+    // Bagsiden følger en meget udglattet dybde, så fx en næse ikke "trykkes igennem".
     const relBack = maskedBlur(rel, inside, cols, rows, Math.max(2, Math.round(maxDim * 0.05)));
     const k = 0.03 + thickness * 1.2;
     const edge = (4 * maxDim) / 256;
     for (let v = 0; v < n; v++) {
       if (!inside[v]) continue;
-      const hGrid = Math.sqrt(2 * u[v]);
+      const hGrid = Math.sqrt(2 * poisson[v]);
       const h = hGrid * cell * k;
       const t = smoothstep(0, edge, hGrid); // 0 ved kanten, 1 længere inde
       zFront[v] = rel[v] * reliefHeight + h;
       zBack[v] = (rel[v] + (relBack[v] - rel[v]) * t) * reliefHeight - h;
+      // For- og bagside må aldrig krydse hinanden (det giver fejl ved 3D-print)
+      if (zFront[v] - zBack[v] < h) {
+        const mid = (zFront[v] + zBack[v]) / 2;
+        zFront[v] = mid + h / 2;
+        zBack[v] = mid - h / 2;
+      }
     }
   } else {
     const base = 0.03 + thickness * 0.25; // pladens tykkelse
     for (let v = 0; v < n; v++) {
       if (!inside[v]) continue;
-      zFront[v] = base + rel[v] * reliefHeight;
+      zFront[v] = Math.max(0.005, base + rel[v] * reliefHeight);
       zBack[v] = 0;
     }
   }
+  lap('højde');
 
-  // ---------- 5. Trekanter for forsiden ----------
-  // Hver gittercelle a-b / c-d bliver til 2 trekanter (eller 1 ved kanten af motivet).
-  const tri = new Uint32Array((cols - 1) * (rows - 1) * 6);
-  let tc = 0;
-  const push = (a, b, c) => {
-    tri[tc++] = a;
-    tri[tc++] = b;
-    tri[tc++] = c;
-  };
-  for (let j = 0; j < rows - 1; j++) {
-    for (let i = 0; i < cols - 1; i++) {
-      const a = j * cols + i;
-      const b = a + 1;
-      const c = a + cols;
-      const d = c + 1;
-      const count = inside[a] + inside[b] + inside[c] + inside[d];
-      if (count === 4) {
-        // Vælg den diagonal, der følger overfladen bedst
-        if (Math.abs(zFront[a] - zFront[d]) <= Math.abs(zFront[b] - zFront[c])) {
-          push(a, c, d);
-          push(a, d, b);
-        } else {
-          push(a, c, b);
-          push(b, c, d);
-        }
-      } else if (count === 3) {
-        if (!inside[a]) push(b, c, d);
-        else if (!inside[b]) push(a, c, d);
-        else if (!inside[c]) push(a, d, b);
-        else push(a, c, b);
-      }
-    }
-  }
-
-  // ---------- 6. Find kanten (kantstykker der kun bruges af én trekant) ----------
-  const edgeCount = new Uint8Array(4 * n);
-  const slot = (p, q) => {
-    if (p > q) {
-      const t = p;
-      p = q;
-      q = t;
-    }
-    const diff = q - p;
-    if (diff === 1) return p; // vandret
-    if (diff === cols) return n + p; // lodret
-    if (diff === cols + 1) return 2 * n + p; // diagonal "\"
-    return 3 * n + p; // diagonal "/" (diff === cols - 1)
-  };
-  for (let t = 0; t < tc; t += 3) {
-    const a = tri[t], b = tri[t + 1], c = tri[t + 2];
-    edgeCount[slot(a, b)]++;
-    edgeCount[slot(b, c)]++;
-    edgeCount[slot(c, a)]++;
-  }
-  const used = new Uint8Array(n);
-  const onBoundary = new Uint8Array(n);
-  const boundaryEdges = []; // par [p, q] i samme retning som i forsidens trekant
-  for (let t = 0; t < tc; t += 3) {
-    const a = tri[t], b = tri[t + 1], c = tri[t + 2];
-    used[a] = used[b] = used[c] = 1;
-    if (edgeCount[slot(a, b)] === 1) { boundaryEdges.push(a, b); onBoundary[a] = onBoundary[b] = 1; }
-    if (edgeCount[slot(b, c)] === 1) { boundaryEdges.push(b, c); onBoundary[b] = onBoundary[c] = 1; }
-    if (edgeCount[slot(c, a)] === 1) { boundaryEdges.push(c, a); onBoundary[c] = onBoundary[a] = 1; }
-  }
-
-  // ---------- 7. Punkter (vertices) ----------
+  // ---------- 5. Punkter (vertices) ----------
   let usedCount = 0;
   let boundaryCount = 0;
   for (let v = 0; v < n; v++) {
@@ -223,7 +182,7 @@ export function buildMeshData({
     }
   }
 
-  // ---------- 8. Trekanter: forside (+ sider) og bagside ----------
+  // ---------- 6. Trekanter: forside (+ sider) og bagside ----------
   const frontTriangles = tc / 3;
   const wallTriangles = isFigure ? 0 : boundaryEdges.length; // 2 trekanter pr. kantstykke
   const indices = new Uint32Array((frontTriangles * 2 + wallTriangles) * 3);
@@ -252,6 +211,7 @@ export function buildMeshData({
     indices[ic++] = backIdx[tri[t + 2]];
     indices[ic++] = backIdx[tri[t + 1]];
   }
+  lap('punkter');
 
   return {
     positions,
@@ -264,7 +224,233 @@ export function buildMeshData({
     vertexCount,
     triangleCount: ic / 3,
     grid: { cols, rows },
+    timings,
+    cleanupPasses: topo.passes,
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* Formen (gemmes mellem kald)                                         */
+/* ------------------------------------------------------------------ */
+
+let topoCache = null;
+
+/**
+ * Finder motivets punkter i gitteret, binder dem sammen med trekanter og
+ * "puster" figuren op. Resultatet gemmes, så længe billede, maske,
+ * opløsning og form er de samme.
+ */
+function getTopology(depth, mask, width, height, cols, rows, isFigure) {
+  const c = topoCache;
+  if (c && c.depth === depth && c.mask === mask && c.cols === cols && c.rows === rows && c.isFigure === isFigure) {
+    return c;
+  }
+  const n = cols * rows;
+  const sx = (width - 1) / (cols - 1);
+  const sy = (height - 1) / (rows - 1);
+
+  // --- Aflæs dybde og maske i gitterpunkterne ---
+  const raw = new Float32Array(n);
+  let inside = new Uint8Array(n);
+  if (sx >= 1.5) {
+    // Gitteret er grovere end billedet: brug gennemsnittet af alle pixels i cellen
+    // (kun pixels på motivet). Det giver renere former end at nøjes med én pixel.
+    const area = getAreaSums(depth, mask, width, height);
+    for (let j = 0, v = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++, v++) {
+        area.mean(i * sx, j * sy, sx / 2, sy / 2);
+        raw[v] = area.depth;
+        inside[v] = area.coverage >= 0.5 ? 1 : 0;
+      }
+    }
+  } else {
+    // Gitteret er finere end billedet: aflæs mellem pixels (bilineært)
+    for (let j = 0, v = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++, v++) {
+        raw[v] = sample(depth, width, height, i * sx, j * sy);
+        inside[v] = mask ? (sample(mask, width, height, i * sx, j * sy) >= 128 ? 1 : 0) : 1;
+      }
+    }
+  }
+  if (isFigure) inside = openMask(inside, cols, rows);
+  if (mask) inside = cleanMask(inside, cols, rows);
+  let insideCount = 0;
+  for (let v = 0; v < n; v++) insideCount += inside[v];
+  if (insideCount < 16) {
+    const err = new Error('Kunne ikke finde et motiv i billedet.');
+    err.code = 'NO_SUBJECT';
+    throw err;
+  }
+
+  // --- Trekanter for forsiden ---
+  // Hver gittercelle a-b / c-d bliver til 2 trekanter (eller 1 ved kanten af motivet).
+  // Hver kant har sit eget nummer ("slot"), så vi kan tælle hvor mange trekanter der
+  // bruger den: kanter der kun bruges af én trekant, er motivets omrids.
+  //   vandret a-b: a    lodret a-c: n+a    diagonal a-d: 2n+a    diagonal b-c: 3n+a
+  const maxIdx = (cols - 1) * (rows - 1) * 6;
+  const tri = new Uint32Array(maxIdx);
+  const triEdge = new Uint32Array(maxIdx); // kant-nummer for kanten tri[t] → næste hjørne
+  const edgeCount = new Uint8Array(4 * n);
+  const used = new Uint8Array(n);
+  const onBoundary = new Uint8Array(n);
+  const nearEdge = new Uint8Array(n);
+  let boundaryEdges = []; // par [p, q] i samme retning som i forsidens trekant
+  let tc = 0;
+  const pushTri = (a, b, cc, eab, ebc, eca) => {
+    tri[tc] = a;
+    triEdge[tc++] = eab;
+    tri[tc] = b;
+    triEdge[tc++] = ebc;
+    tri[tc] = cc;
+    triEdge[tc++] = eca;
+  };
+  const nextCorner = (t) => (t % 3 === 2 ? t - 2 : t + 1);
+
+  // I en "figur" deler for- og bagside punkterne langs omridset. Hvis et smalt sted
+  // i motivet kun er ét punkt tykt, ville det give en kant med 4 trekanter (en fejl
+  // ved 3D-print). Sker det, fjerner vi ét punkt dér og prøver igen.
+  let passes = 0;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    passes++;
+    // Punkter inde i motivet med en nabo udenfor ("kant-agtige" punkter)
+    for (let j = 0, v = 0; j < rows; j++) {
+      for (let i = 0; i < cols; i++, v++) {
+        nearEdge[v] =
+          inside[v] &&
+          (i === 0 || j === 0 || i === cols - 1 || j === rows - 1 ||
+            !inside[v - 1] || !inside[v + 1] || !inside[v - cols] || !inside[v + cols] ||
+            !inside[v - cols - 1] || !inside[v - cols + 1] || !inside[v + cols - 1] || !inside[v + cols + 1])
+            ? 1
+            : 0;
+      }
+    }
+
+    tc = 0;
+    for (let j = 0; j < rows - 1; j++) {
+      for (let i = 0; i < cols - 1; i++) {
+        const a = j * cols + i;
+        const b = a + 1;
+        const cc = a + cols;
+        const d = cc + 1;
+        const count = inside[a] + inside[b] + inside[cc] + inside[d];
+        if (count < 3) continue;
+        const hAB = a;
+        const hCD = cc;
+        const vAC = n + a;
+        const vBD = n + b;
+        const dAD = 2 * n + a;
+        const dBC = 3 * n + a;
+        if (count === 4) {
+          // Undgå en diagonal mellem to kantpunkter – ellers vælg den, der følger overfladen bedst
+          const adNear = nearEdge[a] && nearEdge[d];
+          const bcNear = nearEdge[b] && nearEdge[cc];
+          const useAD = adNear !== bcNear ? !adNear : Math.abs(raw[a] - raw[d]) <= Math.abs(raw[b] - raw[cc]);
+          if (useAD) {
+            pushTri(a, cc, d, vAC, hCD, dAD);
+            pushTri(a, d, b, dAD, vBD, hAB);
+          } else {
+            pushTri(a, cc, b, vAC, dBC, hAB);
+            pushTri(b, cc, d, dBC, hCD, vBD);
+          }
+        } else if (!inside[a]) pushTri(b, cc, d, dBC, hCD, vBD);
+        else if (!inside[b]) pushTri(a, cc, d, vAC, hCD, dAD);
+        else if (!inside[cc]) pushTri(a, d, b, dAD, vBD, hAB);
+        else pushTri(a, cc, b, vAC, dBC, hAB);
+      }
+    }
+
+    edgeCount.fill(0);
+    for (let t = 0; t < tc; t++) edgeCount[triEdge[t]]++;
+    used.fill(0);
+    onBoundary.fill(0);
+    boundaryEdges = [];
+    for (let t = 0; t < tc; t++) {
+      const p = tri[t];
+      used[p] = 1;
+      if (edgeCount[triEdge[t]] === 1) {
+        const q = tri[nextCorner(t)];
+        boundaryEdges.push(p, q);
+        onBoundary[p] = onBoundary[q] = 1;
+      }
+    }
+    if (!isFigure) break;
+
+    // Indvendige kanter mellem to omrids-punkter → fjern det punkt, der har færrest naboer
+    let removed = 0;
+    for (let t = 0; t < tc; t++) {
+      const p = tri[t];
+      if (!onBoundary[p]) continue;
+      const q = tri[nextCorner(t)];
+      if (onBoundary[q] && inside[p] && inside[q] && edgeCount[triEdge[t]] === 2) {
+        const pn = countInsideNeighbours(inside, cols, rows, p);
+        const qn = countInsideNeighbours(inside, cols, rows, q);
+        inside[pn <= qn ? p : q] = 0;
+        removed++;
+      }
+    }
+    if (!removed) break;
+  }
+
+  // "Pust op": løs Poisson-ligningen inde i motivet (kun for figurer)
+  const poisson = isFigure ? solvePoisson(inside, cols, rows) : null;
+  const edgeDist = distanceToEdge(inside, cols, rows);
+
+  topoCache = {
+    depth,
+    mask,
+    cols,
+    rows,
+    isFigure,
+    inside,
+    raw,
+    tri,
+    tc,
+    used,
+    onBoundary,
+    boundaryEdges,
+    poisson,
+    edgeDist,
+    passes,
+  };
+  return topoCache;
+}
+
+/**
+ * Afstand (i gitterceller) fra hvert punkt i motivet til nærmeste punkt udenfor
+ * (billedets kant tæller også som "udenfor"). Hurtig "chamfer"-metode i to gennemløb.
+ */
+function distanceToEdge(inside, cols, rows) {
+  const n = cols * rows;
+  const dist = new Float32Array(n);
+  const D = Math.SQRT2;
+  for (let j = 0, v = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++, v++) {
+      if (!inside[v]) continue;
+      let d = Math.min(i + 1, j + 1, cols - i, rows - j);
+      if (i > 0) d = Math.min(d, dist[v - 1] + 1);
+      if (j > 0) {
+        d = Math.min(d, dist[v - cols] + 1);
+        if (i > 0) d = Math.min(d, dist[v - cols - 1] + D);
+        if (i < cols - 1) d = Math.min(d, dist[v - cols + 1] + D);
+      }
+      dist[v] = d;
+    }
+  }
+  for (let j = rows - 1; j >= 0; j--) {
+    for (let i = cols - 1; i >= 0; i--) {
+      const v = j * cols + i;
+      if (!inside[v]) continue;
+      let d = dist[v];
+      if (i < cols - 1) d = Math.min(d, dist[v + 1] + 1);
+      if (j < rows - 1) {
+        d = Math.min(d, dist[v + cols] + 1);
+        if (i < cols - 1) d = Math.min(d, dist[v + cols + 1] + D);
+        if (i > 0) d = Math.min(d, dist[v + cols - 1] + D);
+      }
+      dist[v] = d;
+    }
+  }
+  return dist;
 }
 
 /* ------------------------------------------------------------------ */
@@ -276,6 +462,82 @@ const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
 function smoothstep(e0, e1, x) {
   const t = clamp01((x - e0) / (e1 - e0));
   return t * t * (3 - 2 * t);
+}
+
+/** Antal af de 8 nabopunkter, der er inde i motivet. */
+function countInsideNeighbours(inside, cols, rows, v) {
+  const i = v % cols;
+  const j = (v - i) / cols;
+  let count = 0;
+  for (let dj = -1; dj <= 1; dj++) {
+    for (let di = -1; di <= 1; di++) {
+      if (!di && !dj) continue;
+      const x = i + di;
+      const y = j + dj;
+      if (x >= 0 && y >= 0 && x < cols && y < rows) count += inside[y * cols + x];
+    }
+  }
+  return count;
+}
+
+/**
+ * "Summed-area tables": gør det muligt at finde gennemsnittet af et vilkårligt
+ * rektangel i billedet med kun 4 opslag. Tabellerne gemmes, så de ikke skal
+ * regnes forfra, hver gang man trækker i en skyder.
+ */
+let areaCache = null;
+function getAreaSums(depth, mask, w, h) {
+  if (areaCache && areaCache.depthRef === depth && areaCache.maskRef === mask) return areaCache;
+  const W = w + 1;
+  const sumD = new Float64Array(W * (h + 1)); // sum af dybde (kun motiv-pixels, hvis der er en maske)
+  const sumM = mask ? new Uint32Array(W * (h + 1)) : null; // antal motiv-pixels
+  for (let y = 0; y < h; y++) {
+    let rowD = 0;
+    let rowM = 0;
+    const src = y * w;
+    const cur = (y + 1) * W + 1;
+    const prev = y * W + 1;
+    for (let x = 0; x < w; x++) {
+      if (mask) {
+        if (mask[src + x] >= 128) {
+          rowD += depth[src + x];
+          rowM++;
+        }
+        sumM[cur + x] = sumM[prev + x] + rowM;
+      } else {
+        rowD += depth[src + x];
+      }
+      sumD[cur + x] = sumD[prev + x] + rowD;
+    }
+  }
+  areaCache = {
+    depthRef: depth,
+    maskRef: mask,
+    depth: 0,
+    coverage: 0,
+    /** Gennemsnit i rektanglet omkring (cx, cy) – resultatet lægges i .depth og .coverage */
+    mean(cx, cy, rx, ry) {
+      const x0 = Math.max(0, Math.round(cx - rx));
+      const x1 = Math.min(w, Math.round(cx + rx) + 1);
+      const y0 = Math.max(0, Math.round(cy - ry));
+      const y1 = Math.min(h, Math.round(cy + ry) + 1);
+      const a = y1 * W + x1;
+      const b = y0 * W + x1;
+      const c = y1 * W + x0;
+      const d = y0 * W + x0;
+      const total = (x1 - x0) * (y1 - y0);
+      const sd = sumD[a] - sumD[b] - sumD[c] + sumD[d];
+      if (!sumM) {
+        this.depth = sd / total;
+        this.coverage = 1;
+        return;
+      }
+      const count = sumM[a] - sumM[b] - sumM[c] + sumM[d];
+      this.coverage = count / total;
+      this.depth = count > 0 ? sd / count : 0;
+    },
+  };
+  return areaCache;
 }
 
 /** Bilineær aflæsning af et 2D-array (w x h) i punktet (x, y). */
