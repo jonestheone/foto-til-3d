@@ -26,6 +26,7 @@
  * @param {'figure'|'relief'} o.mode
  * @param {number} o.depthAmount      0–1: hvor kraftigt dybden vises
  * @param {number} o.thickness        0–1: tykkelse (figur) eller pladetykkelse (relief)
+ * @param {number} o.rounding         0–1: hvor runde kanterne er (0 = skarpe)
  * @param {number} o.detailBoost      0–1: hvor meget små former (næse, øjne, pels) forstærkes
  * @param {number} o.smoothing        0–10: hvor meget dybden glattes
  * @param {number} o.resolution       antal gitterpunkter på den længste led
@@ -38,6 +39,7 @@ export function buildMeshData({
   mode = 'figure',
   depthAmount = 0.35,
   thickness = 0.5,
+  rounding = 0.7,
   detailBoost = 0.4,
   smoothing = 1,
   resolution = 384,
@@ -84,11 +86,16 @@ export function buildMeshData({
 
   // Fremhæv detaljer ("unsharp mask"): forskellen mellem dybden og en udglattet
   // udgave af den er de små former (næse, øjne, pels, folder) – dem forstærker vi.
+  // Store spring i dybden (fx hage → hals) må ikke forstærkes, for så opstår der
+  // skarpe rygge og render langs springet. Derfor "bløddæmpes" store forskelle.
   if (detailBoost > 0) {
     const base = maskedBlur(rel, inside, cols, rows, Math.max(2, Math.round(maxDim * 0.03)));
     const k = detailBoost * 2.5;
+    const limit = 0.05; // forskelle større end ca. 5 % af dybden dæmpes
     for (let v = 0; v < n; v++) {
-      if (inside[v]) rel[v] = Math.min(1.3, Math.max(-0.3, rel[v] + k * (rel[v] - base[v])));
+      if (!inside[v]) continue;
+      const d = rel[v] - base[v];
+      rel[v] += (k * d) / (1 + Math.abs(d) / limit);
     }
   }
 
@@ -139,7 +146,40 @@ export function buildMeshData({
   }
   lap('højde');
 
-  // ---------- 5. Punkter (vertices) ----------
+  // ---------- 5. Afrund kanterne ----------
+  // Position for hvert gitterpunkt på forsiden (F) og bagsiden (B).
+  // I en figur er omrids-punkterne fælles for for- og bagside.
+  const Fx = new Float32Array(n);
+  const Fy = new Float32Array(n);
+  const Bx = new Float32Array(n);
+  const By = new Float32Array(n);
+  const Fz = zFront;
+  const Bz = zBack;
+  for (let j = 0, v = 0; j < rows; j++) {
+    for (let i = 0; i < cols; i++, v++) {
+      if (!used[v]) continue;
+      Fx[v] = Bx[v] = i * cell - halfW;
+      Fy[v] = By[v] = halfH - j * cell;
+      if (isFigure && onBoundary[v]) Fz[v] = Bz[v] = (zFront[v] + zBack[v]) / 2;
+    }
+  }
+  const band = Math.max(3, maxDim / 48); // hvor langt ind fra kanten afrundingen når (gitterceller)
+  if (rounding > 0 && isFigure) {
+    roundFigureEdges({ cols, rows, used, onBoundary, edgeDist, band, pairs: Math.round(rounding * 8), Fx, Fy, Fz, Bx, By, Bz });
+  } else if (rounding > 0) {
+    // Relief: rund pladens øverste kant af med en kvartcirkel
+    const r = Math.max(1, rounding * band);
+    for (let v = 0; v < n; v++) {
+      if (!used[v]) continue;
+      const d = edgeDist[v] - 1; // 0 ved kanten
+      if (d >= r) continue;
+      const drop = (r - Math.sqrt(Math.max(0, r * r - (r - d) * (r - d)))) * cell;
+      Fz[v] = Math.max(Bz[v] + 0.005, Fz[v] - drop);
+    }
+  }
+  lap('afrunding');
+
+  // ---------- 6. Punkter (vertices) ----------
   let usedCount = 0;
   let boundaryCount = 0;
   for (let v = 0; v < n; v++) {
@@ -156,33 +196,32 @@ export function buildMeshData({
   const wallBottom = isFigure ? null : new Int32Array(n).fill(-1);
 
   let vc = 0;
-  const addVertex = (v, z) => {
-    const i = v % cols;
-    const j = (v - i) / cols;
-    positions[vc * 3] = i * cell - halfW;
-    positions[vc * 3 + 1] = halfH - j * cell;
+  const addVertex = (x, y, z) => {
+    positions[vc * 3] = x;
+    positions[vc * 3 + 1] = y;
     positions[vc * 3 + 2] = z;
-    uvs[vc * 2] = (i * sx + 0.5) / width;
-    uvs[vc * 2 + 1] = 1 - (j * sy + 0.5) / height;
+    // Fotoet følger punktets (evt. afrundede) placering
+    uvs[vc * 2] = (((x + halfW) / cell) * sx + 0.5) / width;
+    uvs[vc * 2 + 1] = 1 - (((halfH - y) / cell) * sy + 0.5) / height;
     return vc++;
   };
   for (let v = 0; v < n; v++) {
     if (!used[v]) continue;
     if (isFigure && onBoundary[v]) {
       // Kantpunkter deles af for- og bagside, så modellen bliver lukket
-      frontIdx[v] = backIdx[v] = addVertex(v, (zFront[v] + zBack[v]) / 2);
+      frontIdx[v] = backIdx[v] = addVertex(Fx[v], Fy[v], Fz[v]);
     } else {
-      frontIdx[v] = addVertex(v, zFront[v]);
-      backIdx[v] = addVertex(v, zBack[v]);
+      frontIdx[v] = addVertex(Fx[v], Fy[v], Fz[v]);
+      backIdx[v] = addVertex(Bx[v], By[v], Bz[v]);
     }
     if (!isFigure && onBoundary[v]) {
       // Ekstra punkter til siderne, så de får skarpe kanter
-      wallTop[v] = addVertex(v, zFront[v]);
-      wallBottom[v] = addVertex(v, zBack[v]);
+      wallTop[v] = addVertex(Fx[v], Fy[v], Fz[v]);
+      wallBottom[v] = addVertex(Bx[v], By[v], Bz[v]);
     }
   }
 
-  // ---------- 6. Trekanter: forside (+ sider) og bagside ----------
+  // ---------- 7. Trekanter: forside (+ sider) og bagside ----------
   const frontTriangles = tc / 3;
   const wallTriangles = isFigure ? 0 : boundaryEdges.length; // 2 trekanter pr. kantstykke
   const indices = new Uint32Array((frontTriangles * 2 + wallTriangles) * 3);
@@ -251,7 +290,7 @@ function getTopology(depth, mask, width, height, cols, rows, isFigure) {
 
   // --- Aflæs dybde og maske i gitterpunkterne ---
   const raw = new Float32Array(n);
-  let inside = new Uint8Array(n);
+  let coverage = new Float32Array(n); // hvor stor en del af cellen der er motiv (0–1)
   if (sx >= 1.5) {
     // Gitteret er grovere end billedet: brug gennemsnittet af alle pixels i cellen
     // (kun pixels på motivet). Det giver renere former end at nøjes med én pixel.
@@ -260,7 +299,7 @@ function getTopology(depth, mask, width, height, cols, rows, isFigure) {
       for (let i = 0; i < cols; i++, v++) {
         area.mean(i * sx, j * sy, sx / 2, sy / 2);
         raw[v] = area.depth;
-        inside[v] = area.coverage >= 0.5 ? 1 : 0;
+        coverage[v] = area.coverage;
       }
     }
   } else {
@@ -268,10 +307,15 @@ function getTopology(depth, mask, width, height, cols, rows, isFigure) {
     for (let j = 0, v = 0; j < rows; j++) {
       for (let i = 0; i < cols; i++, v++) {
         raw[v] = sample(depth, width, height, i * sx, j * sy);
-        inside[v] = mask ? (sample(mask, width, height, i * sx, j * sy) >= 128 ? 1 : 0) : 1;
+        coverage[v] = mask ? sample(mask, width, height, i * sx, j * sy) / 255 : 1;
       }
     }
   }
+  // Et blødt omrids: sløres masken lidt, før vi bestemmer hvad der er motiv, forsvinder
+  // trappetrin og tynde takker (fx enkelte hårstrå), og hjørnerne bliver runde.
+  if (mask) coverage = maskedBlur(coverage, new Uint8Array(n).fill(1), cols, rows, Math.max(1, Math.round(Math.max(cols, rows) / 192)));
+  let inside = new Uint8Array(n);
+  for (let v = 0; v < n; v++) inside[v] = coverage[v] >= 0.5 ? 1 : 0;
   if (isFigure) inside = openMask(inside, cols, rows);
   if (mask) inside = cleanMask(inside, cols, rows);
   let insideCount = 0;
@@ -413,6 +457,84 @@ function getTopology(depth, mask, width, height, cols, rows, isFigure) {
     passes,
   };
   return topoCache;
+}
+
+/**
+ * Runder en figurs kanter af med "Taubin-udglatning" af punkterne tæt på omridset:
+ * hvert punkt flyttes lidt mod gennemsnittet af sine naboer (λ-skridt) og derefter
+ * lidt væk igen (μ-skridt). Så bliver den skarpe kant, hvor for- og bagside mødes,
+ * rund – uden at figuren skrumper. Punkter længere inde end `band` røres ikke.
+ */
+function roundFigureEdges({ cols, rows, used, onBoundary, edgeDist, band, pairs, Fx, Fy, Fz, Bx, By, Bz }) {
+  if (pairs <= 0) return;
+  const n = cols * rows;
+  let m = 0;
+  for (let v = 0; v < n; v++) if (used[v] && edgeDist[v] - 1 < band) m++;
+  const list = new Int32Array(m);
+  const weight = new Float32Array(m); // 1 ved kanten → 0 ved "band"
+  const nbr = new Int32Array(m * 4).fill(-1); // op til 4 naboer pr. punkt
+  for (let v = 0, k = 0; v < n; v++) {
+    if (!used[v] || edgeDist[v] - 1 >= band) continue;
+    list[k] = v;
+    weight[k] = 1 - smoothstep(0, band, edgeDist[v] - 1);
+    const i = v % cols;
+    let c = k * 4;
+    if (i > 0 && used[v - 1]) nbr[c++] = v - 1;
+    if (i < cols - 1 && used[v + 1]) nbr[c++] = v + 1;
+    if (v >= cols && used[v - cols]) nbr[c++] = v - cols;
+    if (v < n - cols && used[v + cols]) nbr[c++] = v + cols;
+    k++;
+  }
+  const out = new Float32Array(m * 6);
+
+  const step = (factor) => {
+    for (let k = 0; k < m; k++) {
+      const v = list[k];
+      let fx = 0, fy = 0, fz = 0; // naboer på forsiden
+      let bx = 0, by = 0, bz = 0; // naboer på bagsiden
+      let count = 0;
+      for (let q = k * 4; q < k * 4 + 4; q++) {
+        const u = nbr[q];
+        if (u < 0) break;
+        fx += Fx[u]; fy += Fy[u]; fz += Fz[u];
+        bx += Bx[u]; by += By[u]; bz += Bz[u];
+        count++;
+      }
+      const o = k * 6;
+      if (!count) {
+        out[o] = Fx[v]; out[o + 1] = Fy[v]; out[o + 2] = Fz[v];
+        out[o + 3] = Bx[v]; out[o + 4] = By[v]; out[o + 5] = Bz[v];
+        continue;
+      }
+      const w = weight[k] * factor;
+      if (onBoundary[v]) {
+        // Fælles kantpunkt: trækkes mod gennemsnittet af naboerne på BÅDE for- og bagside
+        const ax = (fx + bx) / (2 * count);
+        const ay = (fy + by) / (2 * count);
+        const az = (fz + bz) / (2 * count);
+        out[o] = out[o + 3] = Fx[v] + w * (ax - Fx[v]);
+        out[o + 1] = out[o + 4] = Fy[v] + w * (ay - Fy[v]);
+        out[o + 2] = out[o + 5] = Fz[v] + w * (az - Fz[v]);
+      } else {
+        out[o] = Fx[v] + w * (fx / count - Fx[v]);
+        out[o + 1] = Fy[v] + w * (fy / count - Fy[v]);
+        out[o + 2] = Fz[v] + w * (fz / count - Fz[v]);
+        out[o + 3] = Bx[v] + w * (bx / count - Bx[v]);
+        out[o + 4] = By[v] + w * (by / count - By[v]);
+        out[o + 5] = Bz[v] + w * (bz / count - Bz[v]);
+      }
+    }
+    for (let k = 0; k < m; k++) {
+      const v = list[k];
+      const o = k * 6;
+      Fx[v] = out[o]; Fy[v] = out[o + 1]; Fz[v] = out[o + 2];
+      Bx[v] = out[o + 3]; By[v] = out[o + 4]; Bz[v] = out[o + 5];
+    }
+  };
+  for (let p = 0; p < pairs; p++) {
+    step(0.5);
+    step(-0.53);
+  }
 }
 
 /**

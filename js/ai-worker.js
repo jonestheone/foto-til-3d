@@ -168,6 +168,18 @@ function status(id, text) {
   self.postMessage({ type: 'status', id, text });
 }
 
+// Hvis AI-biblioteket går ned et sted, hvor fejlen ikke når frem til vores kode
+// (det kan ske, hvis appen lægges i baggrunden midt i en beregning), så sig det til
+// appen, så den kan starte AI-delen forfra i stedet for at vente for evigt.
+let currentJob = null;
+self.addEventListener('unhandledrejection', (event) => {
+  console.error('AI-fejl:', event.reason);
+  if (currentJob === null) return;
+  const reason = event.reason?.message || String(event.reason);
+  self.postMessage({ type: 'error', id: currentJob, message: `AI-delen gik ned (${reason}). Prøv igen.`, fatal: true });
+  currentJob = null;
+});
+
 self.addEventListener('message', async ({ data }) => {
   // Begynd at indlæse modellerne i forvejen (mens brugeren vælger et billede)
   if (data?.type === 'preload') {
@@ -177,6 +189,7 @@ self.addEventListener('message', async ({ data }) => {
   if (data?.type !== 'analyze') return;
   const { id, image, tasks, detail = 'normal' } = data;
   const { width, height } = image;
+  currentJob = id;
   // Hver model får sin egen kopi af billedet (de må gerne ændre i det)
   const makeImage = () => new RawImage(new Uint8ClampedArray(image.data), width, height, 4);
 
@@ -199,9 +212,11 @@ self.addEventListener('message', async ({ data }) => {
     result.device = backend?.device ?? 'wasm';
     console.info(`AI-tider i ms (${result.device}):`, JSON.stringify(timings));
     for (const k of Object.keys(timings)) delete timings[k];
-    self.postMessage(result, transfer);
+    if (currentJob === id) self.postMessage(result, transfer);
   } catch (err) {
     console.error(err);
-    self.postMessage({ type: 'error', id, message: err?.message || String(err) });
+    if (currentJob === id) self.postMessage({ type: 'error', id, message: err?.message || String(err) });
+  } finally {
+    if (currentJob === id) currentJob = null;
   }
 });

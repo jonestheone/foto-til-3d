@@ -46,6 +46,7 @@ const ui = {
 const sliders = {
   depth: { input: $('#opt-depth'), out: $('#val-depth'), format: (v) => `${v} %` },
   thick: { input: $('#opt-thick'), out: $('#val-thick'), format: (v) => `${v} %` },
+  round: { input: $('#opt-round'), out: $('#val-round'), format: (v) => `${v} %` },
   detail: { input: $('#opt-detail'), out: $('#val-detail'), format: (v) => `${v} %` },
   smooth: { input: $('#opt-smooth'), out: $('#val-smooth'), format: (v) => `${v}` },
   res: { input: $('#opt-res'), out: $('#val-res'), format: (v) => `${v}` },
@@ -71,31 +72,62 @@ export const viewer = new Viewer($('#viewer'));
 /* AI-worker (kører i baggrunden)                                      */
 /* ------------------------------------------------------------------ */
 
-const worker = new Worker(new URL('./ai-worker.js', import.meta.url), { type: 'module' });
+const WORKER_TIMEOUT = 180_000; // så længe AI'en må være helt tavs, før vi antager at den er gået i stå
 const jobs = new Map();
 let jobCounter = 0;
+let worker = createWorker();
 
-worker.addEventListener('message', ({ data: msg }) => {
-  if (msg.type === 'progress') return showDownloadProgress(msg);
-  if (msg.type === 'status') return setBusyTitle(msg.text);
-  const job = jobs.get(msg.id);
-  if (!job) return;
-  jobs.delete(msg.id);
-  if (msg.type === 'result') job.resolve(msg);
-  else job.reject(new Error(msg.message));
-});
-worker.addEventListener('error', (e) => {
-  console.error('AI-worker fejl', e);
-  for (const job of jobs.values()) {
-    job.reject(new Error('AI-delen kunne ikke starte. Tjek din internetforbindelse og genindlæs siden.'));
-  }
-  jobs.clear();
-});
+function createWorker() {
+  const w = new Worker(new URL('./ai-worker.js', import.meta.url), { type: 'module' });
+  w.addEventListener('message', ({ data: msg }) => {
+    for (const job of jobs.values()) job.alive(); // AI'en lever – nulstil vagten
+    if (msg.type === 'progress') return showDownloadProgress(msg);
+    if (msg.type === 'status') return setBusyTitle(msg.text);
+    const job = jobs.get(msg.id);
+    if (!job) return;
+    if (msg.type === 'result') job.resolve(msg);
+    else job.reject(new Error(msg.message));
+    if (msg.fatal) restartWorker(); // AI-delen gik ned: start en frisk
+  });
+  w.addEventListener('error', (e) => {
+    console.error('AI-worker fejl', e);
+    failAllJobs('AI-delen kunne ikke starte. Tjek din internetforbindelse og prøv igen.');
+    restartWorker();
+  });
+  return w;
+}
+
+function restartWorker() {
+  worker.terminate();
+  worker = createWorker();
+}
+
+function failAllJobs(message) {
+  for (const job of [...jobs.values()]) job.reject(new Error(message));
+}
 
 function askWorker(message, transfer = []) {
   const id = ++jobCounter;
   return new Promise((resolve, reject) => {
-    jobs.set(id, { resolve, reject });
+    let timer = 0;
+    const done = () => {
+      clearTimeout(timer);
+      jobs.delete(id);
+    };
+    const job = {
+      resolve: (value) => (done(), resolve(value)),
+      reject: (err) => (done(), reject(err)),
+      // Vagt: svarer AI'en ikke i lang tid (fx hvis den er gået i stå), giver vi op og starter forfra
+      alive: () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          job.reject(new Error('AI\'en svarede ikke. Prøv igen.'));
+          restartWorker();
+        }, WORKER_TIMEOUT);
+      },
+    };
+    jobs.set(id, job);
+    job.alive();
     worker.postMessage({ ...message, id }, transfer);
   });
 }
@@ -203,6 +235,7 @@ function currentOptions() {
     mode: state.mode,
     depthAmount: sliders.depth.input.value / 100,
     thickness: sliders.thick.input.value / 100,
+    rounding: sliders.round.input.value / 100,
     detailBoost: sliders.detail.input.value / 100,
     smoothing: Number(sliders.smooth.input.value),
     resolution: Number(sliders.res.input.value),

@@ -31,6 +31,8 @@ Der skal **ikke installeres noget**. Du skal bare have internet første gang, fo
 - **Ekstra skarp dybde**: AI'en ser billedet i højere opløsning (1022 i stedet for 518 px), så øjne, hår
   og folder bliver tydeligere. Det tager længere tid og er derfor kun slået til, når der er et grafikkort.
 - **Dybde / Tykkelse**: hvor meget modellen stikker frem, og hvor tyk den er.
+- **Afrunding**: hvor runde kanterne er. I en figur bliver kanten, hvor for- og bagside mødes, rund
+  i stedet for knivskarp. I et relief får pladen en afrundet øverste kant. 0 % = skarpe kanter.
 - **Fremhæv detaljer**: forstærker de små former (næse, øjne, pels, folder). 0 % = som AI'en så det.
 - **Glathed**: glatter små ujævnheder ud. Lavt tal = flere detaljer, men også mere "støj".
 - **Opløsning**: hvor mange punkter 3D-nettet har (op til 768). Flere punkter = finere detaljer, men større filer.
@@ -65,6 +67,8 @@ Kort fortalt om 3D-formen (`mesh.js`):
 3. I **Figur**-tilstand løses en *Poisson-ligning* inde i motivet. Det giver en blød "ballon-form",
    hvor tynde dele (arme, ører, haler) bliver tynde og tykke dele bliver tykke.
    For- og bagsiden mødes i kanten, så modellen er lukket ("vandtæt") og kan 3D-printes.
+   Omridset sløres en smule, så det ikke bliver takket, og kanten rundes af med
+   *Taubin-udglatning* (punkterne trækkes mod naboerne og lidt tilbage igen, så intet skrumper).
 4. Fotoet (op til 2048 px) bruges som "maling" (tekstur) på modellen. AI'en arbejder selv med 1024 px.
 
 ## Begrænsninger
