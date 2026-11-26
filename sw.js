@@ -8,7 +8,7 @@
  *    versionsnummer og ændrer sig aldrig, så de tages direkte fra cachen.
  *  - AI-modellerne fra Hugging Face gemmer Transformers.js selv.
  */
-const APP_CACHE = 'foto3d-app-v1';
+const APP_CACHE = 'foto3d-app-v2';
 const CDN_CACHE = 'foto3d-cdn-v1';
 const APP_FILES = [
   './',
@@ -20,6 +20,7 @@ const APP_FILES = [
   'js/viewer.js',
   'js/export.js',
   'js/camera.js',
+  'js/ai3d.js',
   'icon.svg',
   'manifest.webmanifest',
   'icons/icon-192.png',

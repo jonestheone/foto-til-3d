@@ -70,7 +70,7 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3M8 7l4-4 4 4M6 11H5v10h14V11h-1"/></svg>
             og vælg <strong>»Føj til hjemmeskærm«</strong> – så får du appen som et ikon.
           </p>
-          <p class="fineprint">Alt foregår i din egen browser – billedet bliver ikke sendt nogen steder hen. Første gang hentes AI-modellerne (70–130 MB), derefter går det hurtigt.</p>
+          <p class="fineprint">Figur og Relief laves i din egen browser – billedet sendes ingen steder hen. Første gang hentes AI-modellerne (70–130 MB), derefter går det hurtigt. Vælger du "360° AI", sendes fotoet til en gratis AI hos Hugging Face.</p>
           <button id="btn-back" class="btn ghost small" type="button" hidden>← Tilbage til modellen</button>
           <input id="file-camera" type="file" accept="image/*" capture="environment" hidden>
           <input id="file-pick" type="file" accept="image/*" hidden>
@@ -104,17 +104,35 @@
         <div class="segmented" role="radiogroup" aria-label="Form">
           <button type="button" class="seg active" data-mode="figure" role="radio" aria-checked="true">Figur</button>
           <button type="button" class="seg" data-mode="relief" role="radio" aria-checked="false">Relief</button>
+          <button type="button" class="seg" data-mode="ai" role="radio" aria-checked="false">360° AI</button>
         </div>
         <p id="mode-help" class="help"></p>
       </section>
 
-      <section class="group">
-        <h3>AI</h3>
+      <!-- Kun i "360° AI": en rigtig 3D-model med bagside fra en gratis AI på Hugging Face -->
+      <section class="group" id="ai-section" hidden>
+        <h3>360° med AI</h3>
+        <div class="segmented" role="radiogroup" aria-label="AI-model">
+          <button type="button" class="seg active" data-engine="fast" role="radio" aria-checked="true">Hurtig</button>
+          <button type="button" class="seg" data-engine="best" role="radio" aria-checked="false">Bedst</button>
+        </div>
+        <p id="engine-help" class="help"></p>
+        <button id="btn-ai" class="btn primary" type="button">Lav 360°-model</button>
+        <p class="help">Fotoet (uden baggrund) sendes til en gratis AI hos Hugging Face, som laver hele modellen – også bagsiden, som AI'en selv gætter. Kræver internet.</p>
+        <details class="token-box">
+          <summary>Hugging Face-nøgle (valgfri)</summary>
+          <p class="help">Med en gratis nøgle fra <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">huggingface.co/settings/tokens</a> får du mere gratis AI-tid hver dag, og "Bedst" virker. Nøglen gemmes kun på denne enhed.</p>
+          <input type="password" id="hf-token" placeholder="hf_…" autocomplete="off" spellcheck="false">
+        </details>
+      </section>
+
+      <section class="group" id="analysis-section">
+        <h3>Analyse</h3>
         <label class="check"><input type="checkbox" id="opt-bg" checked> Fjern baggrund</label>
         <label class="check"><input type="checkbox" id="opt-hd"> Ekstra skarp dybde <span class="check-note">(tager længere tid)</span></label>
       </section>
 
-      <section class="group">
+      <section class="group" id="adjust-section">
         <h3>Justér</h3>
         <div class="field">
           <div class="field-head"><label for="opt-depth">Dybde</label><output id="val-depth"></output></div>
@@ -140,11 +158,12 @@
           <div class="field-head"><label for="opt-res">Opløsning</label><output id="val-res"></output></div>
           <input type="range" id="opt-res" min="64" max="768" step="32" value="384">
         </div>
-        <div class="checks">
-          <label class="check"><input type="checkbox" id="opt-wire"> Vis trådnet</label>
-          <label class="check"><input type="checkbox" id="opt-rotate" checked> Drej automatisk</label>
-        </div>
       </section>
+
+      <div class="checks">
+        <label class="check"><input type="checkbox" id="opt-wire"> Vis trådnet</label>
+        <label class="check"><input type="checkbox" id="opt-rotate" checked> Drej automatisk</label>
+      </div>
 
       <section class="group">
         <h3>Download</h3>

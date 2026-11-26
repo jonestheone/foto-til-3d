@@ -42,6 +42,29 @@ export function exportSTL(mesh, sizeMM = 100) {
   return new Blob([data], { type: 'model/stl' });
 }
 
+/**
+ * STL af AI'ens 360°-model. Den skal stå op på printpladen: i GLB-filer er "op" y,
+ * men 3D-printere bruger z, så modellen vippes 90°.
+ * @param {THREE.Object3D} object
+ * @param {number} sizeMM  længste side i millimeter
+ */
+export function exportSTLStanding(object, sizeMM = 100) {
+  const root = new THREE.Group();
+  root.add(object.clone());
+  root.rotation.x = Math.PI / 2; // y (op i GLB) → z (op på printeren)
+  root.updateMatrixWorld(true);
+  let box = new THREE.Box3().setFromObject(root);
+  const size = box.getSize(new THREE.Vector3());
+  root.scale.setScalar(sizeMM / Math.max(size.x, size.y, size.z));
+  root.updateMatrixWorld(true);
+  box = new THREE.Box3().setFromObject(root);
+  // Centrér, og stil modellen på printpladen (z = 0)
+  root.position.set(-(box.min.x + box.max.x) / 2, -(box.min.y + box.max.y) / 2, -box.min.z);
+  root.updateMatrixWorld(true);
+  const data = new STLExporter().parse(root, { binary: true });
+  return new Blob([data], { type: 'model/stl' });
+}
+
 export function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');

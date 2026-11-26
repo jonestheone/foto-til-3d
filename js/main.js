@@ -5,8 +5,9 @@
  */
 import { Viewer } from './viewer.js';
 import { buildMeshData } from './mesh.js';
-import { exportGLB, exportSTL, downloadBlob } from './export.js';
+import { exportGLB, exportSTL, exportSTLStanding, downloadBlob } from './export.js';
 import { openWebcam } from './camera.js';
+import { generate3D, ENGINES } from './ai3d.js';
 
 const MAX_IMAGE_SIZE = 2048; // fotoet på modellen: op til 2048 px, så det er skarpt
 const ANALYSIS_SIZE = 1024; // det AI'en ser: 1024 px er det, modellerne selv bruger
@@ -42,6 +43,12 @@ const ui = {
   optRotate: $('#opt-rotate'),
   dlGlb: $('#dl-glb'),
   dlStl: $('#dl-stl'),
+  aiSection: $('#ai-section'),
+  analysisSection: $('#analysis-section'),
+  adjustSection: $('#adjust-section'),
+  btnAi: $('#btn-ai'),
+  engineHelp: $('#engine-help'),
+  hfToken: $('#hf-token'),
 };
 const sliders = {
   depth: { input: $('#opt-depth'), out: $('#val-depth'), format: (v) => `${v} %` },
@@ -51,9 +58,28 @@ const sliders = {
   smooth: { input: $('#opt-smooth'), out: $('#val-smooth'), format: (v) => `${v}` },
   res: { input: $('#opt-res'), out: $('#val-res'), format: (v) => `${v}` },
 };
+// Indstillinger der huskes på enheden (localStorage kan være slået fra – så glemmes de bare)
+const settings = {
+  get(key) {
+    try {
+      return localStorage.getItem(`foto3d.${key}`) ?? '';
+    } catch {
+      return '';
+    }
+  },
+  set(key, value) {
+    try {
+      localStorage.setItem(`foto3d.${key}`, value);
+    } catch {
+      /* ignorér */
+    }
+  },
+};
+
 const MODE_HELP = {
   figure: 'Motivet pustes op med en afrundet bagside – godt til ting, dyr og personer.',
   relief: 'Billedet bliver en plade med relief og flad bagside – godt til 3D-print og landskaber.',
+  ai: 'En rigtig 3D-model hele vejen rundt – også bagsiden – lavet af en gratis AI på nettet.',
 };
 
 export const state = {
@@ -63,7 +89,10 @@ export const state = {
   mask: null, // Uint8Array i analyse-størrelse – 255 = motiv, 0 = baggrund
   bledTexture: null, // fotoet hvor motivets farver er "smurt" ud over kanten (se makeBledTexture)
   device: null, // 'webgpu' eller 'wasm'
-  mode: 'figure',
+  mode: 'figure', // 'figure', 'relief' eller 'ai' (360° med AI)
+  meshStats: null, // { vertexCount, triangleCount } for vores egen model
+  ai: null, // { blob, engineName, triangles } – 360°-modellen fra AI'en
+  aiEngine: settings.get('engine') === 'best' ? 'best' : 'fast',
   busy: false,
 };
 export const viewer = new Viewer($('#viewer'));
@@ -174,9 +203,15 @@ export async function handleFile(file) {
   state.depth = null;
   state.mask = null;
   state.bledTexture = null;
+  state.ai = null;
+  viewer.clearAI();
+  viewer.showAI(false);
+  updateAIButton();
   drawThumb(ui.thumbPhoto, canvas);
 
   await analyze({ depth: true, background: ui.optBg.checked }, { reframe: true });
+  // Står appen på "360° AI", laves 360°-modellen med det samme
+  if (state.mode === 'ai' && state.depth) await makeAI360();
 }
 
 /** Tegn et billede på et nyt canvas, så den længste side højst er maxSize. */
@@ -232,7 +267,7 @@ async function analyze(tasks, { reframe = false } = {}) {
 
 function currentOptions() {
   return {
-    mode: state.mode,
+    mode: state.mode === 'relief' ? 'relief' : 'figure', // i "360° AI" vises en figur, indtil AI'en er færdig
     depthAmount: sliders.depth.input.value / 100,
     thickness: sliders.thick.input.value / 100,
     rounding: sliders.round.input.value / 100,
@@ -260,9 +295,152 @@ export function rebuild({ reframe = false } = {}) {
   }
   setTexture(masked && state.bledTexture ? state.bledTexture : state.photo.canvas);
   viewer.setModel(data, { reframe });
+  state.meshStats = { vertexCount: data.vertexCount, triangleCount: data.triangleCount };
+  updateStats();
+}
 
-  const where = state.device === 'webgpu' ? 'grafikkortet (WebGPU)' : 'processoren (WASM)';
-  ui.stats.textContent = `${formatNumber(data.vertexCount)} punkter · ${formatNumber(data.triangleCount)} trekanter · AI kørte på ${where}`;
+function updateStats() {
+  if (state.mode === 'ai' && state.ai) {
+    ui.stats.textContent = `360°-model fra ${state.ai.engineName} · ${formatNumber(state.ai.triangles)} trekanter`;
+  } else if (state.meshStats) {
+    const where = state.device === 'webgpu' ? 'grafikkortet (WebGPU)' : 'processoren (WASM)';
+    const { vertexCount, triangleCount } = state.meshStats;
+    ui.stats.textContent = `${formatNumber(vertexCount)} punkter · ${formatNumber(triangleCount)} trekanter · AI kørte på ${where}`;
+  } else {
+    ui.stats.textContent = '';
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 360° med AI (en rigtig model med bagside – se ai3d.js)              */
+/* ------------------------------------------------------------------ */
+
+async function makeAI360() {
+  if (!state.photo || state.busy) return;
+  state.busy = true;
+  showBusy('Forbereder billedet …');
+  ui.busyText.textContent = 'Fotoet sendes til en gratis AI hos Hugging Face. Det tager typisk 10 sekunder – 2 minutter.';
+  try {
+    await ensureMask();
+    const cutout = await makeCutout();
+    const token = ui.hfToken.value.trim();
+    const onStatus = (s) => {
+      if (s.stage === 'connecting') setBusyTitle(`Forbinder til ${s.engine} …`);
+      else if (s.stage === 'queue') setBusyTitle(s.position > 0 ? `I kø hos Hugging Face – nr. ${s.position + 1} …` : 'AI\'en starter …');
+      else if (s.stage === 'generating') setBusyTitle('AI\'en bygger 3D-modellen …');
+      else if (s.stage === 'downloading') setBusyTitle('Henter 3D-modellen …');
+    };
+
+    let result;
+    let fellBack = false;
+    try {
+      result = await generate3D(cutout, { engine: state.aiEngine, token, onStatus });
+    } catch (err) {
+      if (state.aiEngine !== 'best') throw err;
+      // "Bedst" virkede ikke (fx ingen nøgle eller ingen kvote) – prøv "Hurtig"
+      console.warn('TRELLIS fejlede – prøver Stable Fast 3D', err);
+      result = await generate3D(cutout, { engine: 'fast', token, onStatus });
+      fellBack = true;
+    }
+
+    setBusyTitle('Viser 3D-modellen …');
+    const { triangles } = await viewer.loadAIModel(result.glb);
+    // Drej modellen, så fotoets side vender mod kameraet
+    const turn = viewer.alignAIToPhoto(state.mask, state.analysis.width, state.analysis.height);
+    console.info('360°-model drejet:', turn);
+    state.ai = { blob: result.glb, engineName: result.engineName, triangles };
+    if (state.mode === 'ai') {
+      viewer.showAI(true);
+      viewer.frame();
+    }
+    updateStats();
+    updateAIButton();
+    if (fellBack) {
+      showToast('"Bedst" (TRELLIS) kunne ikke bruges lige nu, så "Hurtig" blev brugt i stedet. Med en gratis Hugging Face-nøgle virker "Bedst" som regel.', 'info');
+    }
+  } catch (err) {
+    console.error(err);
+    showToast(aiErrorText(err));
+  } finally {
+    state.busy = false;
+    hideBusy();
+  }
+}
+
+function aiErrorText(err) {
+  switch (err?.code) {
+    case 'QUOTA':
+      return 'Dagens gratis AI-tid hos Hugging Face er brugt op. Prøv igen senere – eller indsæt en gratis Hugging Face-nøgle under "360° med AI".';
+    case 'UNAVAILABLE':
+      return `AI-tjenesten svarer ikke lige nu. Prøv igen om lidt. (${err.message})`;
+    case 'TIMEOUT':
+      return 'AI\'en var for længe om det. Prøv igen om lidt.';
+    default:
+      return `AI'en kunne ikke lave modellen: ${err?.message ?? err}`;
+  }
+}
+
+/** AI'en skal have et udklip – find motivet, hvis det ikke allerede er gjort. */
+async function ensureMask() {
+  if (state.mask) return;
+  setBusyTitle('Finder motivet …');
+  const { canvas, width, height } = state.analysis;
+  const pixels = canvas.getContext('2d').getImageData(0, 0, width, height).data;
+  const res = await askWorker(
+    { type: 'analyze', image: { data: pixels, width, height }, tasks: { background: true, depth: false } },
+    [pixels.buffer],
+  );
+  state.mask = res.mask;
+  state.bledTexture = makeBledTexture(state.photo, scaleMask(state.mask, state.analysis, state.photo));
+}
+
+/** Udklip af motivet som PNG med gennemsigtig baggrund (og lidt luft rundt om). */
+async function makeCutout() {
+  const { canvas, width, height } = state.analysis;
+  const mask = state.mask;
+  let x0 = width;
+  let y0 = height;
+  let x1 = -1;
+  let y1 = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (mask[y * width + x] < 128) continue;
+      if (x < x0) x0 = x;
+      if (x > x1) x1 = x;
+      if (y < y0) y0 = y;
+      if (y > y1) y1 = y;
+    }
+  }
+  if (x1 < 0) throw new Error('kunne ikke finde et motiv i billedet.');
+  const w = x1 - x0 + 1;
+  const h = y1 - y0 + 1;
+  const pad = Math.round(Math.max(w, h) * 0.08); // gennemsigtig kant hele vejen rundt
+  const out = document.createElement('canvas');
+  out.width = w + 2 * pad;
+  out.height = h + 2 * pad;
+  const ctx = out.getContext('2d');
+  ctx.drawImage(canvas, x0, y0, w, h, pad, pad, w, h);
+  const img = ctx.getImageData(pad, pad, w, h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) img.data[(y * w + x) * 4 + 3] = mask[(y + y0) * width + x + x0];
+  }
+  ctx.putImageData(img, pad, pad);
+  return new Promise((resolve) => out.toBlob(resolve, 'image/png'));
+}
+
+function setEngine(engine) {
+  state.aiEngine = engine;
+  settings.set('engine', engine);
+  for (const btn of document.querySelectorAll('[data-engine]')) {
+    const active = btn.dataset.engine === engine;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-checked', String(active));
+  }
+  ui.engineHelp.textContent = ENGINES[engine].help;
+}
+
+function updateAIButton() {
+  ui.btnAi.textContent = state.ai ? 'Lav en ny 360°-model' : 'Lav 360°-model';
 }
 
 let currentTexture = null;
@@ -402,7 +580,16 @@ function setMode(mode) {
     btn.setAttribute('aria-checked', String(active));
   }
   ui.modeHelp.textContent = MODE_HELP[mode];
-  scheduleRebuild();
+
+  // "360° AI" har sine egne knapper; skyderne gælder kun vores egne modeller
+  const ai = mode === 'ai';
+  ui.aiSection.hidden = !ai;
+  ui.analysisSection.hidden = ai;
+  ui.adjustSection.hidden = ai;
+  viewer.showAI(ai && Boolean(state.ai));
+  if (ai && state.ai) viewer.frame();
+  else scheduleRebuild();
+  updateStats();
 }
 
 /* ------------------------------------------------------------------ */
@@ -660,12 +847,29 @@ ui.optWire.addEventListener('change', () => viewer.setWireframe(ui.optWire.check
 ui.optRotate.addEventListener('change', () => viewer.setAutoRotate(ui.optRotate.checked));
 viewer.setAutoRotate(ui.optRotate.checked);
 
+const showingAI = () => state.mode === 'ai' && state.ai && viewer.aiGroup;
 ui.dlGlb.addEventListener('click', () =>
-  withButton(ui.dlGlb, async () => downloadBlob(await exportGLB(viewer.mesh), fileName('glb'))),
+  withButton(ui.dlGlb, async () => {
+    // 360°-modellen gemmes præcis som AI'en lavede den
+    if (showingAI()) downloadBlob(state.ai.blob, fileName('glb', '360'));
+    else downloadBlob(await exportGLB(viewer.mesh), fileName('glb'));
+  }),
 );
 ui.dlStl.addEventListener('click', () =>
-  withButton(ui.dlStl, async () => downloadBlob(exportSTL(viewer.mesh), fileName('stl'))),
+  withButton(ui.dlStl, async () => {
+    if (showingAI()) downloadBlob(exportSTLStanding(viewer.aiGroup), fileName('stl', '360'));
+    else downloadBlob(exportSTL(viewer.mesh), fileName('stl'));
+  }),
 );
+
+// 360° med AI
+for (const btn of document.querySelectorAll('[data-engine]')) {
+  btn.addEventListener('click', () => setEngine(btn.dataset.engine));
+}
+setEngine(state.aiEngine);
+ui.hfToken.value = settings.get('hfToken');
+ui.hfToken.addEventListener('change', () => settings.set('hfToken', ui.hfToken.value.trim()));
+ui.btnAi.addEventListener('click', makeAI360);
 
 async function withButton(button, fn) {
   button.disabled = true;
@@ -767,10 +971,11 @@ function toMB(bytes) {
 function formatNumber(n) {
   return n.toLocaleString('da-DK');
 }
-function fileName(ext) {
+function fileName(ext, kind = '') {
   const d = new Date();
   const p = (x) => String(x).padStart(2, '0');
-  return `foto-3d-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.${ext}`;
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  return `foto-3d-${kind ? `${kind}-` : ''}${stamp}.${ext}`;
 }
 
 setMode(state.mode);
