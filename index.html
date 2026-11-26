@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Foto til 3D</title>
+  <meta name="description" content="Tag et billede og lav det om til en 3D-model – direkte i browseren.">
+  <meta name="theme-color" content="#0d0f14">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="manifest.webmanifest">
+  <!-- Til telefonen: ikon og fuldskærm, når appen er lagt på hjemmeskærmen -->
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-title" content="Foto 3D">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="stylesheet" href="css/style.css">
+
+  <!-- Three.js (3D-grafik) hentes fra et CDN, så der ikke skal installeres noget -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.187.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.187.0/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icon.svg" alt="" width="28" height="28">
+      <span>Foto til 3D</span>
+    </div>
+    <button id="btn-new" class="btn ghost small" type="button" hidden>
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      Nyt billede
+    </button>
+  </header>
+
+  <main class="layout">
+    <!-- Venstre/øverst: 3D-visningen -->
+    <section class="stage" id="stage">
+      <div id="viewer" class="viewer" aria-label="3D-visning"></div>
+      <p id="viewer-hint" class="viewer-hint" hidden>Træk for at dreje · scroll eller knib for at zoome · højreklik for at flytte</p>
+
+      <!-- Startskærm -->
+      <div id="start" class="overlay start">
+        <div class="card start-card">
+          <h1>Gør et foto til en 3D&#8209;model</h1>
+          <p class="muted">Tag et billede af en ting, et dyr eller en person. AI'en finder motivet, gætter dybden og bygger en 3D-model, som du kan dreje rundt og downloade.</p>
+          <div class="start-buttons">
+            <button id="btn-camera" class="btn primary big" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+              Tag billede
+            </button>
+            <button id="btn-pick" class="btn big" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/></svg>
+              Vælg billede
+            </button>
+          </div>
+          <p class="hint desktop-only">… eller træk et billede herind, eller indsæt med Ctrl+V</p>
+          <button id="btn-install" class="btn ghost small install" type="button" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>
+            Installér som app
+          </button>
+          <p id="ios-hint" class="ios-hint" hidden>
+            Tip: Tryk på <strong>Del</strong>-knappen
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V3M8 7l4-4 4 4M6 11H5v10h14V11h-1"/></svg>
+            og vælg <strong>»Føj til hjemmeskærm«</strong> – så får du appen som et ikon.
+          </p>
+          <p class="fineprint">Alt foregår i din egen browser – billedet bliver ikke sendt nogen steder hen. Første gang hentes AI-modellerne (70–130 MB), derefter går det hurtigt.</p>
+          <button id="btn-back" class="btn ghost small" type="button" hidden>← Tilbage til modellen</button>
+          <input id="file-camera" type="file" accept="image/*" capture="environment" hidden>
+          <input id="file-pick" type="file" accept="image/*" hidden>
+        </div>
+      </div>
+
+      <!-- Mens AI'en arbejder -->
+      <div id="busy" class="overlay busy" hidden>
+        <div class="card busy-card" role="status" aria-live="polite">
+          <div class="spinner" aria-hidden="true"></div>
+          <h2 id="busy-title">Arbejder …</h2>
+          <p id="busy-text" class="muted"></p>
+          <div id="progress-list" class="progress-list"></div>
+        </div>
+      </div>
+
+      <div id="drop-hint" class="drop-hint" hidden>Slip billedet her</div>
+      <div id="toast" class="toast" role="alert" hidden></div>
+    </section>
+
+    <!-- Højre/nederst: indstillinger -->
+    <aside id="panel" class="panel" hidden>
+      <div class="thumbs">
+        <figure><canvas id="thumb-photo" width="1" height="1"></canvas><figcaption>Foto</figcaption></figure>
+        <figure><canvas id="thumb-mask" width="1" height="1"></canvas><figcaption>Motiv</figcaption></figure>
+        <figure><canvas id="thumb-depth" width="1" height="1"></canvas><figcaption>Dybde</figcaption></figure>
+      </div>
+
+      <section class="group">
+        <h3>Form</h3>
+        <div class="segmented" role="radiogroup" aria-label="Form">
+          <button type="button" class="seg active" data-mode="figure" role="radio" aria-checked="true">Figur</button>
+          <button type="button" class="seg" data-mode="relief" role="radio" aria-checked="false">Relief</button>
+        </div>
+        <p id="mode-help" class="help"></p>
+        <label class="check"><input type="checkbox" id="opt-bg" checked> Fjern baggrund</label>
+      </section>
+
+      <section class="group">
+        <h3>Justér</h3>
+        <div class="field">
+          <div class="field-head"><label for="opt-depth">Dybde</label><output id="val-depth"></output></div>
+          <input type="range" id="opt-depth" min="0" max="100" value="35">
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="opt-thick">Tykkelse</label><output id="val-thick"></output></div>
+          <input type="range" id="opt-thick" min="0" max="100" value="50">
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="opt-smooth">Glathed</label><output id="val-smooth"></output></div>
+          <input type="range" id="opt-smooth" min="0" max="10" value="3">
+        </div>
+        <div class="field">
+          <div class="field-head"><label for="opt-res">Detaljer</label><output id="val-res"></output></div>
+          <input type="range" id="opt-res" min="64" max="512" step="32" value="256">
+        </div>
+        <div class="checks">
+          <label class="check"><input type="checkbox" id="opt-wire"> Vis trådnet</label>
+          <label class="check"><input type="checkbox" id="opt-rotate" checked> Drej automatisk</label>
+        </div>
+      </section>
+
+      <section class="group">
+        <h3>Download</h3>
+        <div class="downloads">
+          <button id="dl-glb" class="btn primary" type="button"><span>GLB</span><small>3D med farver</small></button>
+          <button id="dl-stl" class="btn" type="button"><span>STL</span><small>til 3D-print</small></button>
+        </div>
+      </section>
+
+      <p id="stats" class="stats"></p>
+    </aside>
+  </main>
+
+  <!-- Webcam (bruges på computer – på mobilen åbner telefonens egen kamera-app) -->
+  <dialog id="cam-dialog" class="cam-dialog">
+    <video id="cam-video" autoplay playsinline muted></video>
+    <div class="cam-actions">
+      <button type="button" id="cam-switch" class="btn ghost" hidden>Skift kamera</button>
+      <button type="button" id="cam-shoot" class="btn primary big">Tag billede</button>
+      <button type="button" id="cam-cancel" class="btn ghost">Annuller</button>
+    </div>
+  </dialog>
+
+  <noscript><p class="noscript">Appen kræver JavaScript.</p></noscript>
+</body>
+</html>
